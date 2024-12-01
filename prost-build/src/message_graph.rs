@@ -4,7 +4,10 @@ use petgraph::algo::has_path_connecting;
 use petgraph::graph::NodeIndex;
 use petgraph::Graph;
 
-use prost_types::{field_descriptor_proto, DescriptorProto, FileDescriptorProto};
+use prost_types::{
+    field_descriptor_proto::{Label, Type},
+    DescriptorProto, FieldDescriptorProto, FileDescriptorProto,
+};
 
 /// `MessageGraph` builds a graph of messages whose edges correspond to nesting.
 /// The goal is to recognize when message types are recursively nested, so
@@ -12,6 +15,7 @@ use prost_types::{field_descriptor_proto, DescriptorProto, FileDescriptorProto};
 pub struct MessageGraph {
     index: HashMap<String, NodeIndex>,
     graph: Graph<String, ()>,
+    messages: HashMap<String, DescriptorProto>,
 }
 
 impl MessageGraph {
@@ -21,6 +25,7 @@ impl MessageGraph {
         let mut msg_graph = MessageGraph {
             index: HashMap::new(),
             graph: Graph::new(),
+            messages: HashMap::new(),
         };
 
         for file in files {
@@ -41,6 +46,7 @@ impl MessageGraph {
         let MessageGraph {
             ref mut index,
             ref mut graph,
+            ..
         } = *self;
         assert_eq!(b'.', msg_name.as_bytes()[0]);
         *index
@@ -58,17 +64,21 @@ impl MessageGraph {
         let msg_index = self.get_or_insert_index(msg_name.clone());
 
         for field in &msg.field {
-            if field.r#type() == field_descriptor_proto::Type::Message
-                && field.label() != field_descriptor_proto::Label::Repeated
-            {
+            if field.r#type() == Type::Message && field.label() != Label::Repeated {
                 let field_index = self.get_or_insert_index(field.type_name.clone().unwrap());
                 self.graph.add_edge(msg_index, field_index, ());
             }
         }
+        self.messages.insert(msg_name.clone(), msg.clone());
 
         for msg in &msg.nested_type {
             self.add_message(&msg_name, msg);
         }
+    }
+
+    /// Try get a message descriptor from current message graph
+    pub fn get_message(&self, message: &str) -> Option<&DescriptorProto> {
+        self.messages.get(message)
     }
 
     /// Returns true if message type `inner` is nested in message type `outer`.
@@ -83,5 +93,24 @@ impl MessageGraph {
         };
 
         has_path_connecting(&self.graph, outer, inner, None)
+    }
+
+    pub fn message_has_lifetime(&self, fq_message_name: &str) -> bool {
+        assert_eq!(".", &fq_message_name[..1]);
+        self.get_message(fq_message_name)
+            .unwrap()
+            .field
+            .iter()
+            .any(|field| self.field_has_lifetime(fq_message_name, field))
+    }
+
+    pub fn field_has_lifetime(&self, fq_message_name: &str, field: &FieldDescriptorProto) -> bool {
+        assert_eq!(".", &fq_message_name[..1]);
+
+        if field.r#type() == Type::Message {
+            self.message_has_lifetime(field.type_name())
+        } else {
+            matches!(field.r#type(), Type::String)
+        }
     }
 }

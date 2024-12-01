@@ -52,13 +52,15 @@ fn prost_path(config: &Config) -> &str {
 struct Field {
     descriptor: FieldDescriptorProto,
     path_index: i32,
+    has_lifetime: bool,
 }
 
 impl Field {
-    fn new(descriptor: FieldDescriptorProto, path_index: i32) -> Self {
+    fn new(descriptor: FieldDescriptorProto, path_index: i32, has_lifetime: bool) -> Self {
         Self {
             descriptor,
             path_index,
+            has_lifetime,
         }
     }
 
@@ -71,14 +73,17 @@ struct OneofField {
     descriptor: OneofDescriptorProto,
     fields: Vec<Field>,
     path_index: i32,
+    has_lifetime: bool,
 }
 
 impl OneofField {
     fn new(descriptor: OneofDescriptorProto, fields: Vec<Field>, path_index: i32) -> Self {
+        let has_lifetime = fields.iter().any(|f| f.has_lifetime);
         Self {
             descriptor,
             fields,
             path_index,
+            has_lifetime,
         }
     }
 
@@ -203,12 +208,14 @@ impl<'a> CodeGenerator<'a> {
             .enumerate()
             .partition_map(|(idx, proto)| {
                 let idx = idx as i32;
+                let field_has_lifetime =
+                    self.config.enable_cow && self.message_graph.field_has_lifetime(".x", &proto);
                 if proto.proto3_optional.unwrap_or(false) {
-                    Either::Left(Field::new(proto, idx))
+                    Either::Left(Field::new(proto, idx, field_has_lifetime))
                 } else if let Some(oneof_index) = proto.oneof_index {
-                    Either::Right((oneof_index, Field::new(proto, idx)))
+                    Either::Right((oneof_index, Field::new(proto, idx, field_has_lifetime)))
                 } else {
-                    Either::Left(Field::new(proto, idx))
+                    Either::Left(Field::new(proto, idx, field_has_lifetime))
                 }
             });
         // Optional fields create a synthetic oneof that we want to skip
@@ -238,6 +245,11 @@ impl<'a> CodeGenerator<'a> {
         self.push_indent();
         self.buf.push_str("pub struct ");
         self.buf.push_str(&to_upper_camel(&message_name));
+        let message_needs_lifetime =
+            self.config.enable_cow && self.message_graph.message_has_lifetime(&fq_message_name);
+        if message_needs_lifetime {
+            self.buf.push_str("<'a>");
+        }
         self.buf.push_str(" {\n");
 
         self.depth += 1;
@@ -594,9 +606,10 @@ impl<'a> CodeGenerator<'a> {
         self.append_field_attributes(fq_message_name, oneof.descriptor.name());
         self.push_indent();
         self.buf.push_str(&format!(
-            "pub {}: ::core::option::Option<{}>,\n",
+            "pub {}: ::core::option::Option<{}{}>,\n",
             oneof.rust_name(),
-            type_name
+            type_name,
+            oneof.has_lifetime.then(|| "<'a>").unwrap_or(""),
         ));
     }
 
@@ -621,6 +634,11 @@ impl<'a> CodeGenerator<'a> {
         self.push_indent();
         self.buf.push_str("pub enum ");
         self.buf.push_str(&to_upper_camel(oneof.descriptor.name()));
+        let message_needs_lifetime =
+            self.config.enable_cow && self.message_graph.message_has_lifetime(&fq_message_name);
+        if message_needs_lifetime {
+            self.buf.push_str("<'a>");
+        }
         self.buf.push_str(" {\n");
 
         self.path.push(2);
@@ -877,8 +895,8 @@ impl<'a> CodeGenerator<'a> {
                 let name = method.name.take().unwrap();
                 let input_proto_type = method.input_type.take().unwrap();
                 let output_proto_type = method.output_type.take().unwrap();
-                let input_type = self.resolve_ident(&input_proto_type);
-                let output_type = self.resolve_ident(&output_proto_type);
+                let input_type = self.resolve_ident(&input_proto_type).0;
+                let output_type = self.resolve_ident(&output_proto_type).0;
                 let client_streaming = method.client_streaming();
                 let server_streaming = method.server_streaming();
 
@@ -950,7 +968,10 @@ impl<'a> CodeGenerator<'a> {
             Type::Int32 | Type::Sfixed32 | Type::Sint32 | Type::Enum => String::from("i32"),
             Type::Int64 | Type::Sfixed64 | Type::Sint64 => String::from("i64"),
             Type::Bool => String::from("bool"),
-            Type::String => format!("{}::alloc::string::String", prost_path(self.config)),
+            Type::String => match self.config.enable_cow {
+                false => format!("{}::alloc::string::String", prost_path(self.config)),
+                true => format!("{}::alloc::borrow::Cow<'a, str>", prost_path(self.config)),
+            },
             Type::Bytes => self
                 .config
                 .bytes_type
@@ -959,16 +980,28 @@ impl<'a> CodeGenerator<'a> {
                 .unwrap_or_default()
                 .rust_type()
                 .to_owned(),
-            Type::Group | Type::Message => self.resolve_ident(field.type_name()),
+            Type::Group | Type::Message => {
+                let (mut s, is_extern) = self.resolve_ident(field.type_name());
+                if !is_extern
+                    && self.config.enable_cow
+                    && self
+                        .message_graph
+                        .field_has_lifetime(fq_message_name, field)
+                {
+                    s.push_str("<'a>");
+                }
+                s
+            }
         }
     }
 
-    fn resolve_ident(&self, pb_ident: &str) -> String {
+    /// Returns the identifier and a bool indicating if its an extern
+    fn resolve_ident(&self, pb_ident: &str) -> (String, bool) {
         // protoc should always give fully qualified identifiers.
         assert_eq!(".", &pb_ident[..1]);
 
         if let Some(proto_ident) = self.extern_paths.resolve_ident(pb_ident) {
-            return proto_ident;
+            return (proto_ident, true);
         }
 
         let mut local_path = self
@@ -994,11 +1027,12 @@ impl<'a> CodeGenerator<'a> {
             ident_path.next();
         }
 
-        local_path
+        let s = local_path
             .map(|_| "super".to_string())
             .chain(ident_path.map(to_snake))
             .chain(iter::once(to_upper_camel(ident_type)))
-            .join("::")
+            .join("::");
+        (s, false)
     }
 
     fn field_type_tag(&self, field: &FieldDescriptorProto) -> Cow<'static, str> {
@@ -1016,13 +1050,16 @@ impl<'a> CodeGenerator<'a> {
             Type::Sfixed32 => Cow::Borrowed("sfixed32"),
             Type::Sfixed64 => Cow::Borrowed("sfixed64"),
             Type::Bool => Cow::Borrowed("bool"),
-            Type::String => Cow::Borrowed("string"),
+            Type::String => match self.config.enable_cow {
+                true => Cow::Borrowed("cow_str"),
+                false => Cow::Borrowed("string"),
+            },
             Type::Bytes => Cow::Borrowed("bytes"),
             Type::Group => Cow::Borrowed("group"),
             Type::Message => Cow::Borrowed("message"),
             Type::Enum => Cow::Owned(format!(
                 "enumeration={:?}",
-                self.resolve_ident(field.type_name())
+                self.resolve_ident(field.type_name()).0
             )),
         }
     }
@@ -1031,7 +1068,7 @@ impl<'a> CodeGenerator<'a> {
         match field.r#type() {
             Type::Enum => Cow::Owned(format!(
                 "enumeration({})",
-                self.resolve_ident(field.type_name())
+                self.resolve_ident(field.type_name()).0
             )),
             _ => self.field_type_tag(field),
         }

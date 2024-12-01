@@ -193,6 +193,7 @@ impl Field {
             Kind::Plain(ref default) | Kind::Required(ref default) => {
                 let default = default.typed();
                 match self.ty {
+                    Ty::CowStr => quote!(#ident = ::prost::alloc::borrow::Cow::Borrowed("")),
                     Ty::String | Ty::Bytes(..) => quote!(#ident.clear()),
                     _ => quote!(#ident = #default),
                 }
@@ -397,6 +398,7 @@ pub enum Ty {
     Sfixed64,
     Bool,
     String,
+    CowStr,
     Bytes(BytesTy),
     Enumeration(Path),
 }
@@ -441,6 +443,7 @@ impl Ty {
             Meta::Path(ref name) if name.is_ident("sfixed64") => Ty::Sfixed64,
             Meta::Path(ref name) if name.is_ident("bool") => Ty::Bool,
             Meta::Path(ref name) if name.is_ident("string") => Ty::String,
+            Meta::Path(ref name) if name.is_ident("cow_str") => Ty::CowStr,
             Meta::Path(ref name) if name.is_ident("bytes") => Ty::Bytes(BytesTy::Vec),
             Meta::NameValue(MetaNameValue {
                 ref path,
@@ -485,6 +488,7 @@ impl Ty {
             "sfixed32" => Ty::Sfixed32,
             "sfixed64" => Ty::Sfixed64,
             "bool" => Ty::Bool,
+            "cow_str" => Ty::CowStr,
             "string" => Ty::String,
             "bytes" => Ty::Bytes(BytesTy::Vec),
             s if s.len() > enumeration_len && &s[..enumeration_len] == "enumeration" => {
@@ -522,6 +526,7 @@ impl Ty {
             Ty::Sfixed64 => "sfixed64",
             Ty::Bool => "bool",
             Ty::String => "string",
+            Ty::CowStr => "cow_str",
             Ty::Bytes(..) => "bytes",
             Ty::Enumeration(..) => "enum",
         }
@@ -530,6 +535,7 @@ impl Ty {
     // TODO: rename to 'owned_type'.
     pub fn rust_type(&self) -> TokenStream {
         match self {
+            Ty::CowStr => quote!(::prost::alloc::borrow::Cow<'a, str>),
             Ty::String => quote!(::prost::alloc::string::String),
             Ty::Bytes(ty) => ty.rust_type(),
             _ => self.rust_ref_type(),
@@ -552,7 +558,7 @@ impl Ty {
             Ty::Sfixed32 => quote!(i32),
             Ty::Sfixed64 => quote!(i64),
             Ty::Bool => quote!(bool),
-            Ty::String => quote!(&str),
+            Ty::CowStr | Ty::String => quote!(&str),
             Ty::Bytes(..) => quote!(&[u8]),
             Ty::Enumeration(..) => quote!(i32),
         }
@@ -567,7 +573,7 @@ impl Ty {
 
     /// Returns false if the scalar type is length delimited (i.e., `string` or `bytes`).
     pub fn is_numeric(&self) -> bool {
-        !matches!(self, Ty::String | Ty::Bytes(..))
+        !matches!(self, Ty::CowStr | Ty::String | Ty::Bytes(..))
     }
 }
 
@@ -609,6 +615,7 @@ pub enum DefaultValue {
     U64(u64),
     Bool(bool),
     String(String),
+    CowStr(std::borrow::Cow<'static, str>),
     Bytes(Vec<u8>),
     Enumeration(TokenStream),
     Path(Path),
@@ -773,6 +780,7 @@ impl DefaultValue {
 
             Ty::Bool => DefaultValue::Bool(false),
             Ty::String => DefaultValue::String(String::new()),
+            Ty::CowStr => DefaultValue::CowStr(std::borrow::Cow::Borrowed("")),
             Ty::Bytes(..) => DefaultValue::Bytes(Vec::new()),
             Ty::Enumeration(ref path) => DefaultValue::Enumeration(quote!(#path::default())),
         }
@@ -784,6 +792,10 @@ impl DefaultValue {
                 quote!(::prost::alloc::string::String::new())
             }
             DefaultValue::String(ref value) => quote!(#value.into()),
+            DefaultValue::CowStr(ref value) if value.is_empty() => {
+                quote!(::prost::alloc::borrow::Cow::Borrowed(""))
+            }
+            DefaultValue::CowStr(ref value) => quote!(#value.into()),
             DefaultValue::Bytes(ref value) if value.is_empty() => {
                 quote!(::core::default::Default::default())
             }
@@ -816,6 +828,7 @@ impl ToTokens for DefaultValue {
             DefaultValue::U64(value) => value.to_tokens(tokens),
             DefaultValue::Bool(value) => value.to_tokens(tokens),
             DefaultValue::String(ref value) => value.to_tokens(tokens),
+            DefaultValue::CowStr(ref value) => value.to_tokens(tokens),
             DefaultValue::Bytes(ref value) => {
                 let byte_str = LitByteStr::new(value, Span::call_site());
                 tokens.append_all(quote!(#byte_str as &[u8]));
