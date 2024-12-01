@@ -42,6 +42,7 @@ pub struct Config {
     pub(crate) extern_paths: Vec<(String, String)>,
     pub(crate) default_package_filename: String,
     pub(crate) enable_type_names: bool,
+    pub(crate) enable_cow: bool,
     pub(crate) type_name_domains: PathMap<String>,
     pub(crate) protoc_args: Vec<OsString>,
     pub(crate) protoc_executable: PathBuf,
@@ -639,6 +640,12 @@ impl Config {
         self
     }
 
+    /// Configures the code generator to use Cow<'a, str> for String
+    pub fn enable_cow(&mut self) -> &mut Self {
+        self.enable_cow = true;
+        self
+    }
+
     /// Specify domain names to use with message type URLs.
     ///
     /// # Domains
@@ -1164,6 +1171,7 @@ impl default::Default for Config {
             extern_paths: Vec::new(),
             default_package_filename: "_".to_string(),
             enable_type_names: false,
+            enable_cow: false,
             type_name_domains: PathMap::default(),
             protoc_args: Vec::new(),
             protoc_executable: protoc_from_env(),

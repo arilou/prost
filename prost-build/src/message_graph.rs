@@ -153,4 +153,23 @@ impl MessageGraph {
             )
         }
     }
+
+    pub fn message_has_lifetime(&self, fq_message_name: &str) -> bool {
+        assert_eq!(".", &fq_message_name[..1]);
+        self.get_message(fq_message_name)
+            .unwrap()
+            .field
+            .iter()
+            .any(|field| self.field_has_lifetime(fq_message_name, field))
+    }
+
+    pub fn field_has_lifetime(&self, fq_message_name: &str, field: &FieldDescriptorProto) -> bool {
+        assert_eq!(".", &fq_message_name[..1]);
+
+        if field.r#type() == Type::Message {
+            self.message_has_lifetime(field.type_name())
+        } else {
+            matches!(field.r#type(), Type::String)
+        }
+    }
 }
